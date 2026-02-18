@@ -1,0 +1,58 @@
+# ============================================================
+# KTVyrps .gitignore
+# ============================================================
+
+# ----与项目无关的本地文件夹 ----
+KaiF/
+Key/
+LX/
+
+# ---- 运行时数据（音乐文件 & 分离缓存）----
+vedio/
+separated/
+.accelerate/
+
+# ---- Python----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.env
+venv/
+env/
+.venv/
+
+# ---- Android / Gradle ----
+Andriod/.gradle/
+Andriod/.idea/
+Andriod/.kotlin/
+Andriod/build/
+Andriod/app/build/
+Andriod/app/release/
+Andriod/local.properties
+Andriod/captures/
+Andriod/.externalNativeBuild/
+Andriod/.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.hprof
+
+# ---- IDE ----
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
