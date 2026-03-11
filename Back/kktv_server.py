@@ -1,7 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-KKTV 后端服务 v3.4 - 修复切歌/mode同步/歌词健壮性
+KKTV 后端服务 v3.5 - AMD显卡适配 + 自动环境配置 + bug修复
 Author: Yrps
+
+★ v3.5 变更:
+  - 【新增】启动时自动检测并安装缺失依赖（demucs/torchaudio/torchcodec/numpy）
+  - 【新增】自动检测AMD显卡，安装 torch-directml 实现GPU加速
+  - 【新增】DEMUCS_SCRIPT 设备优先级: DirectML(AMD) > CUDA(NVIDIA) > CPU
+  - 【新增】音乐/分离目录路径自动推断，无需手动改路径
+  - 【修复】qrcode img.save() TypeError: unexpected keyword argument 'format'
+  - 【修复】NumPy >= 2.x 导致模块崩溃，自动降级
 
 ★ v3.4 变更:
   - 新增 /api/tv/skip TV专用切歌端点（不触发心跳skip标记，避免双跳）
@@ -33,8 +41,103 @@ from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 from enum import Enum
 
-import socket
-import threading
+
+# ============================================================
+# 自动环境配置（必须在第三方包 import 之前运行）
+# ============================================================
+def _auto_setup():
+    """启动时自动检测环境、安装缺失依赖、配置AMD显卡"""
+
+    def _pip(*pkgs):
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install"] + list(pkgs) +
+            ["-q", "--disable-pip-version-check"]
+        )
+
+    # ── 1. NumPy 版本检查（>= 2.x 会导致已编译C扩展崩溃）──
+    try:
+        import importlib.metadata as _md
+        _nv = _md.version("numpy")
+        if int(_nv.split(".")[0]) >= 2:
+            print("[Setup] NumPy {} 版本过高，正在降级到 <2 ...".format(_nv))
+            _pip("numpy<2")
+            print("[Setup] ✅ NumPy 降级完成，请重新运行本程序！")
+            sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+    # ── 2. 检查并安装缺失的必要依赖 ──
+    _DEPS = [
+        ("flask",      "flask"),
+        ("flask_cors", "flask-cors"),
+        ("qrcode",     "qrcode[pil]"),
+        ("requests",   "requests"),
+        ("numpy",      "numpy<2"),
+        ("torchaudio", "torchaudio"),
+        ("torchcodec", "torchcodec"),
+    ]
+    _missing = []
+    for _mod, _pkg in _DEPS:
+        try:
+            __import__(_mod)
+        except ImportError:
+            _missing.append(_pkg)
+    if _missing:
+        print("[Setup] 安装缺失依赖: {}".format(", ".join(_missing)))
+        try:
+            _pip(*_missing)
+            print("[Setup] ✅ 依赖安装完成")
+        except Exception as _e:
+            print("[Setup] ⚠️  部分依赖安装失败: {}".format(_e))
+            print("[Setup]    请手动执行: pip install {}".format(
+                " ".join(_missing)))
+
+    # ── 2b. demucs 深度校验（防止残留坏安装）──
+    _demucs_ok = False
+    try:
+        from demucs.pretrained import get_model  # noqa: F401
+        from demucs.apply import apply_model     # noqa: F401
+        _demucs_ok = True
+    except Exception:
+        pass
+    if not _demucs_ok:
+        print("[Setup] demucs 不可用或安装不完整，正在重新安装...")
+        try:
+            _pip("--force-reinstall", "demucs")
+            print("[Setup] ✅ demucs 重新安装完成")
+        except Exception as _e:
+            print("[Setup] ⚠️  demucs 安装失败: {}".format(_e))
+            print("[Setup]    请手动执行: pip install --force-reinstall demucs")
+
+    # ── 3. AMD 显卡检测 → 自动安装 torch-directml ──
+    try:
+        __import__("torch_directml")
+        return  # 已装好
+    except ImportError:
+        pass
+    if sys.platform == "win32":
+        try:
+            _r = subprocess.run(
+                ["wmic", "path", "win32_VideoController", "get", "name"],
+                capture_output=True, text=True, timeout=5)
+            _gpu = _r.stdout.upper()
+            if "AMD" in _gpu or "RADEON" in _gpu:
+                print("[Setup] 检测到 AMD 显卡，正在安装 DirectML 加速支持...")
+                try:
+                    _pip("torch-directml")
+                    print("[Setup] ✅ torch-directml 安装完成，"
+                          "音源分离将使用 AMD GPU 加速")
+                except Exception as _e:
+                    print("[Setup] ⚠️  torch-directml 安装失败: {}".format(_e))
+                    print("[Setup]    可手动: pip install torch-directml")
+        except Exception:
+            pass
+
+_auto_setup()
+
+# ── 第三方包（到这里时依赖已经就绪）──
 import numpy as np
 import qrcode
 import requests as req_lib
@@ -48,11 +151,14 @@ from flask_cors import CORS
 # ============================================================
 # 全局配置
 # ============================================================
+_BASE_DIR = Path(__file__).resolve().parent.parent   # …/Back/../ → KKTV根目录
+
+
 class Config:
     PLAYER_HOST = "127.0.0.1"
     PLAYER_PORT = 23330
-    MUSIC_DIR = r"F:\KKTV\vedio"
-    SEPARATED_DIR = r"F:\KKTV\separated"
+    MUSIC_DIR = str(_BASE_DIR / "vedio")
+    SEPARATED_DIR = str(_BASE_DIR / "separated")
     LX_DOWNLOAD_DIR = ""
     SERVE_HOST = "0.0.0.0"
     SERVE_PORT = 8080
@@ -260,9 +366,8 @@ class LxMusicClient:
     def scheme_play_song(self, name, singer, source, songmid,
                          types=None, album_name="", interval="",
                          img="", album_id="",
-                         str_media_mid="", album_mid=""):
-        """★ 精确播放：使用 music/play 接口，传入平台歌曲ID。根据 source 自动附加平台特定参数。
-        """
+                         str_media_mid="", album_mid="",
+                         hash_=""):
         if not types:
             types = [{"type": "128k"}, {"type": "320k"}]
 
@@ -282,12 +387,17 @@ class LxMusicClient:
         if album_id:
             data["albumId"] = str(album_id)
 
-        # ★★★ 平台特定参数 ★★★
         if source == "tx":
-            # tx源必传 strMediaMid
             data["strMediaMid"] = str(str_media_mid or songmid)
             if album_mid:
                 data["albumMid"] = str(album_mid)
+        elif source == "kg":
+            if hash_:
+                data["hash"] = hash_
+            if types:
+                for t in types:
+                    if "hash" not in t and hash_:
+                        t["hash"] = hash_
 
         json_str = json.dumps(data, ensure_ascii=False)
         encoded = urllib.parse.quote(json_str)
@@ -299,8 +409,9 @@ class LxMusicClient:
                 name, singer, source, songmid))
         else:
             print("[Scheme] 精确播放调用失败")
-    
-        return ok
+        return ok    # ★★★ 这行是关键，之前漏了 ★★★
+
+
 
 
 
@@ -555,8 +666,7 @@ class MusicSearcher:
     @staticmethod
     def _search_online(keyword, limit=30):
         # type: (str, int) -> List[dict]
-        """★ v3.5:酷我音乐优先→ QQ音乐备选
-        """
+        """★ v3.6: 酷我优先 → 网易云备选 → 酷狗备选"""
         results = []  # type: List[dict]
         # 优先酷我
         try:
@@ -565,14 +675,83 @@ class MusicSearcher:
                 return results
         except Exception as e:
             print("[搜索] 酷我: {}".format(e))
-        # 备用：QQ音乐
+        # 备用1：网易云音乐
         try:
-            results = MusicSearcher._api_qq(keyword, limit)
+            results = MusicSearcher._api_netease(keyword, limit)
             if results:
                 return results
         except Exception as e:
-            print("[搜索] QQ音乐: {}".format(e))
+            print("[搜索] 网易云: {}".format(e))
+        # 备用2：酷狗音乐
+        try:
+            results = MusicSearcher._api_kugou(keyword, limit)
+            if results:
+                return results
+        except Exception as e:
+            print("[搜索] 酷狗: {}".format(e))
         return results
+
+    @staticmethod
+    def _api_kugou(keyword, limit):
+        # type: (str, int) -> List[dict]
+        """酷狗音乐搜索API"""
+        url = "http://mobilecdn.kugou.com/api/v3/search/song"
+        params = {
+            "keyword": keyword,
+            "page": 1,
+            "pagesize": limit,
+            "showtype": 1,
+        }
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 Chrome/120.0.0.0"),
+        }
+        resp = req_lib.get(url, params=params, headers=headers, timeout=8)
+        resp.encoding = "utf-8"
+        data = resp.json()
+
+        if data.get("errcode") != 0 or "data" not in data:
+            return []
+
+        results = []
+        song_list = data["data"].get("info", [])
+        for s in song_list:
+            dur_sec = s.get("duration", 0)
+            interval = ""
+            if dur_sec > 0:
+                interval = "{:02d}:{:02d}".format(dur_sec // 60, dur_sec % 60)
+
+            # ★ 酷狗的 FileHash 是 lx-music kg源必传字段
+            file_hash = s.get("FileHash", s.get("HQFileHash", ""))
+            # songmid 用 audio_id 或 hash
+            audio_id = s.get("audio_id", s.get("Audioid", ""))
+
+            singer_name = s.get("singername", "")
+            song_name = s.get("songname", "")
+
+            # ★ 提取可用音质
+            types_list = [{"type": "128k", "hash": file_hash}]
+            hq_hash = s.get("HQFileHash", "")
+            if hq_hash:
+                types_list.append({"type": "320k", "hash": hq_hash})
+            sq_hash = s.get("SQFileHash", "")
+            if sq_hash:
+                types_list.append({"type": "flac", "hash": sq_hash})
+
+            results.append({
+                "name": song_name,
+                "singer": singer_name,
+                "album": s.get("album_name", ""),
+                "duration": dur_sec,
+                "interval": interval,
+                "source": "online",
+                "songmid": str(audio_id) if audio_id else file_hash,
+                "search_source": "kg",          # ★ lx-music源标识
+                "hash": file_hash,              # ★ kg源必传
+                "types": types_list,            # ★ 含hash的音质列表
+            })
+        return results
+
 
     @staticmethod
     def _api_kuwo(keyword, limit):
@@ -650,8 +829,7 @@ class MusicSearcher:
                            "AppleWebKit/537.36 Chrome/120.0.0.0"),
             "Content-Type": "application/x-www-form-urlencoded"
         }
-        resp = req_lib.post(url, data={"s": keyword, "type": 1,
-                                       "limit": limit, "offset": 0},
+        resp = req_lib.post(url, data={"s": keyword, "type": 1,"limit": limit, "offset": 0},
                             headers=headers, timeout=8)
         resp.encoding = "utf-8"
         data = resp.json()
@@ -667,6 +845,9 @@ class MusicSearcher:
             interval = ""
             if dur_sec > 0:
                 interval = "{:02d}:{:02d}".format(dur_sec // 60, dur_sec % 60)
+
+            song_id = s.get("id", "")
+
             results.append({
                 "name": s.get("name", ""),
                 "singer": artists,
@@ -674,6 +855,8 @@ class MusicSearcher:
                 "duration": dur_sec,
                 "interval": interval,
                 "source": "online",
+                "songmid": str(song_id),       # ★ 网易云歌曲ID
+                "search_source": "wy",          # ★ lx-music源标识
             })
         return results
 
@@ -974,7 +1157,7 @@ class SongState(Enum):
 class SongInfo:
     def __init__(self, name, singer, source="online", album="",
                  interval="", file_path="", songmid="", search_source="",
-                 str_media_mid="", album_mid=""):
+                 str_media_mid="", album_mid="", hash_=""):
         self.name = name
         self.singer = singer
         self.source = source
@@ -983,8 +1166,9 @@ class SongInfo:
         self.file_path = file_path
         self.songmid = songmid
         self.search_source = search_source
-        self.str_media_mid = str_media_mid    # ★ tx源必传
-        self.album_mid = album_mid            # ★ tx源选传
+        self.str_media_mid = str_media_mid    # tx源必传
+        self.album_mid = album_mid            # tx源选传
+        self.hash_ = hash_                    # ★ kg源必传
         self.state = SongState.QUEUED
         self.error_msg = ""
         self.vocals_path = ""
@@ -1000,6 +1184,7 @@ class SongInfo:
         self.uid = hashlib.md5(
             "{}-{}-{:.4f}".format(name, singer, time.time()).encode()
         ).hexdigest()[:12]
+
 
 
     def to_dict(self):
@@ -1736,8 +1921,9 @@ class QueueManager:
     def _download_semi_auto(self, song):
         self._set_song_state(song, SongState.DOWNLOADING)
         dl_guard.start()
-        print("[DL] 半自动触发: {} - {} (songmid={}, source={})".format(
-            song.name, song.singer, song.songmid, song.search_source))
+        print("[DL] 半自动触发: {} - {} (songmid={}, source={}, hash={})".format(
+            song.name, song.singer, song.songmid, song.search_source,
+            song.hash_[:16] if song.hash_ else ""))
 
         # ★ 有songmid时用精确播放，否则回退模糊搜索
         if song.songmid and song.search_source:
@@ -1750,6 +1936,7 @@ class QueueManager:
                 interval=song.interval,
                 str_media_mid=song.str_media_mid,
                 album_mid=song.album_mid,
+                hash_=song.hash_,              # ★ 传递hash
             )
         else:
             ok = lx.scheme_search_play(
@@ -1790,6 +1977,7 @@ class QueueManager:
                 if not verified:
                     print("[DL] ⚠️ 3次skip后仍未找到正确版本")
 
+
         paused = lx.pause_with_retry(max_retries=5, interval=0.5)
         if not paused:
             print("[DL] ⚠️ 暂停确认失败，强制继续")
@@ -1808,6 +1996,7 @@ class QueueManager:
         song._download_triggered_at = time.time()
         self._set_song_state(song, SongState.NEEDS_DOWNLOAD)
         print("[DL] 等待手动下载: {} - {}".format(song.name, song.singer))
+
 
 
 
@@ -2138,10 +2327,30 @@ try:
 except ImportError:
     print("ERROR: demucs unavailable"); sys.exit(1)
 
+# ── 设备选择: DirectML(AMD) > CUDA(NVIDIA) > CPU ──
+def _pick_device():
+    # 优先 DirectML（AMD显卡）
+    try:
+        import torch_directml
+        d = torch_directml.device()
+        # 快速验证：在设备上创建一个小张量确认可用
+        torch.zeros(1, device=d)
+        print("Device: DirectML (AMD GPU)", flush=True)
+        return d
+    except Exception:
+        pass
+    # 其次 CUDA（NVIDIA显卡）
+    if torch.cuda.is_available():
+        print("Device: cuda (NVIDIA GPU)", flush=True)
+        return torch.device("cuda")
+    # 兜底 CPU
+    print("Device: cpu", flush=True)
+    return torch.device("cpu")
+
+dev = _pick_device()
+
 model = get_model("htdemucs")
 model.eval()
-dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Device:", dev, flush=True)
 model.to(dev)
 
 wav, sr = torchaudio.load(sys.argv[1])
@@ -2156,8 +2365,22 @@ wm, ws = ref.mean(), ref.std()
 wn = (wav - wm) / (ws + 1e-8)
 wi = wn.unsqueeze(0).to(dev)
 print("Separating...", flush=True)
-with torch.no_grad():
-    src = apply_model(model, wi, device=dev)
+
+# ── GPU 分离，如遇不兼容算子则自动回退 CPU ──
+try:
+    with torch.no_grad():
+        src = apply_model(model, wi, device=dev)
+except Exception as e:
+    if dev.type != "cpu":
+        print("WARNING: GPU failed ({}), retrying on CPU...".format(e), flush=True)
+        dev = torch.device("cpu")
+        model.to(dev)
+        wi = wi.to(dev)
+        with torch.no_grad():
+            src = apply_model(model, wi, device=dev)
+    else:
+        raise
+
 src = src * (ws + 1e-8) + wm
 src = src.cpu()
 
@@ -2504,14 +2727,17 @@ def api_queue_add():
         interval=d.get("interval", ""),
         file_path=d.get("file_path", ""),
         songmid=d.get("songmid", ""),
-        search_source=d.get("search_source", ""),str_media_mid=d.get("str_media_mid", ""),
+        search_source=d.get("search_source", ""),
+        str_media_mid=d.get("str_media_mid", ""),
         album_mid=d.get("album_mid", ""),
+        hash_=d.get("hash", ""),               # ★ 接收hash
     )
     ok, msg = queue.add(song)
     return json_resp({
         "ok": ok, "msg": msg, "uid": song.uid,
         "version": queue.get_version(),
     })
+
 
 
 
@@ -2651,7 +2877,7 @@ def api_qrcode():
     url = "http://{}:{}/jukebox".format(Config.LAN_IP, Config.SERVE_PORT)
     img = qrcode.make(url, box_size=8, border=2)
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, "PNG")
     buf.seek(0)
     return send_file(buf, mimetype="image/png")
 
@@ -2665,7 +2891,7 @@ def api_qrcode_url():
 @app.route("/api")
 def api_index():
     return json_resp({
-        "name": "KKTV Backend API v3.4",
+        "name": "KKTV Backend API v3.5",
         "changelog": [
             "新增 /api/tv/skip TV专用切歌（避免双跳）",
             "TVState 新增 set_mode + mode_changed_at",
@@ -2982,34 +3208,41 @@ function mkCard(s, badges, isLocal, rank){
   var ssrc=s.search_source||'';
   var smm=s.str_media_mid||'';
   var amm=s.album_mid||'';
+  var hsh=s.hash||'';                // ★ 新增hash
   var rankHtml='';
   if(rank>=0){
     var rc=rank<1?'t1':rank<2?'t2':rank<3?'t3':'tn';
     rankHtml='<span class="rank '+rc+'">'+(rank+1)+'</span>';
   }
+  // ★ 搜索源标签
+  var srcBadge='';
+  if(ssrc==='kw')srcBadge='<span class="chart-src kw">酷我</span>';
+  else if(ssrc==='wy')srcBadge='<span class="chart-src" style="background:#e60026;color:#fff">网易</span>';
+  else if(ssrc==='kg')srcBadge='<span class="chart-src" style="background:#2ca2f9;color:#fff">酷狗</span>';
+  else if(ssrc==='tx')srcBadge='<span class="chart-src qq">QQ</span>';
+
   return '<div class="card"><div class="info" style="display:flex;align-items:center">'
     +rankHtml
     +'<div style="min-width:0">'
-    +'<div class="nm">'+he(s.name)+badges+'</div>'
+    +'<div class="nm">'+he(s.name)+badges+srcBadge+'</div>'
     +'<div class="ar">'+he(s.singer||'未知')+(alb?' · '+he(alb):'')
       +(dur?' · <span class="dur">'+dur+'</span>':'')
     +'</div></div></div><div class="acts">'
     +'<button class="ab" onclick="add(this,'+js(s.name)+','+js(s.singer)+','+js(src)+','+js(fp)+','+js(alb)+','+js(iv)
-      +','+js(mid)+','+js(ssrc)+','+js(smm)+','+js(amm)
+      +','+js(mid)+','+js(ssrc)+','+js(smm)+','+js(amm)+','+js(hsh)
       +')" title="点歌">+</button>'
     +'</div></div>';
 }
 
-
-
-function add(btn,nm,sg,src,fp,alb,iv,mid,ssrc,smm,amm){
+function add(btn,nm,sg,src,fp,alb,iv,mid,ssrc,smm,amm,hsh){
   btn.disabled=true; btn.textContent='…';
   fetch('/api/queue/add',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({name:nm,singer:sg,source:src,
       file_path:fp,album:alb,interval:iv,
       songmid:mid||'',search_source:ssrc||'',
-      str_media_mid:smm||'',album_mid:amm||''})}).then(function(r){return r.json()})
+      str_media_mid:smm||'',album_mid:amm||'',
+      hash:hsh||''})}).then(function(r){return r.json()})    // ★ 传hash
   .then(function(d){
     toast(d.msg);
     if(d.ok){
@@ -3020,6 +3253,7 @@ function add(btn,nm,sg,src,fp,alb,iv,mid,ssrc,smm,amm){
     else{btn.disabled=false;btn.textContent='+'}ubadge();
   }).catch(function(){btn.disabled=false;btn.textContent='+'});
 }
+
 
 
 
@@ -3529,7 +3763,7 @@ def page_jukebox():
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("  🎤 KKTV Backend v3.4")
+    print("  🎤 KKTV Backend v3.5")
     print("=" * 60)
     print("  lx-music:  http://{}:{}".format(
         Config.PLAYER_HOST, Config.PLAYER_PORT))
